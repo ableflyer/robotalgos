@@ -11,6 +11,50 @@ import torch.nn.functional as F
 # Import YOLO
 from yolov5 import detect as yolo_detect
 
+def detect_dominant_color(frame):
+    """
+    Detect if the dominant color is red, blue, yellow, or none of them
+    Returns the color name and the percentage of that color
+    """
+    # Convert BGR to HSV
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    
+    # Define color ranges in HSV
+    color_ranges = {
+        'red': [
+            ((0, 70, 50), (10, 255, 255)),     # Lower red range
+            ((170, 70, 50), (180, 255, 255))   # Upper red range
+        ],
+        'blue': [((100, 70, 50), (130, 255, 255))],
+        'yellow': [((20, 70, 50), (35, 255, 255))]
+    }
+    
+    # Calculate percentage of each color
+    color_percentages = {}
+    total_pixels = frame.shape[0] * frame.shape[1]
+    
+    for color, ranges in color_ranges.items():
+        mask = np.zeros((frame.shape[0], frame.shape[1]), dtype=np.uint8)
+        
+        # Combine masks for all ranges of this color
+        for (lower, upper) in ranges:
+            lower = np.array(lower)
+            upper = np.array(upper)
+            color_mask = cv2.inRange(hsv, lower, upper)
+            mask = cv2.bitwise_or(mask, color_mask)
+            
+        color_pixels = cv2.countNonZero(mask)
+        percentage = (color_pixels / total_pixels) * 100
+        color_percentages[color] = percentage
+    
+    # Find the dominant color (if any meets the threshold)
+    threshold = 15  # Minimum percentage to consider a color dominant
+    dominant_color = max(color_percentages.items(), key=lambda x: x[1])
+    
+    if dominant_color[1] >= threshold:
+        return dominant_color[0], dominant_color[1]
+    return "none", 0.0
+
 def accuracy(outputs, labels):
     _, preds = torch.max(outputs, dim=1)
     return torch.tensor(torch.sum(preds == labels).item() / len(preds))
@@ -126,8 +170,8 @@ def main():
         transforms.ToTensor()
     ])
     
-    # Define classes for classification (update this to match your trained model)
-    classes = ['glass', 'metal', 'plastic']  # Updated to 8 classes
+    # Define classes for classification
+    classes = ['glass', 'metal', 'plastic']
     
     # Initialize classification model with correct number of classes
     classification_model = ResNet(len(classes))
@@ -165,10 +209,15 @@ def main():
             # Make classification prediction on detected object
             predicted_class, confidence = predict_frame(object_frame, classification_model, device, transformations, classes)
             
+            # Detect color of the object
+            color, color_percentage = detect_dominant_color(object_frame)
+            
             # Draw bounding box and prediction on frame
             x1, y1, x2, y2 = bbox
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            text = f"{predicted_class} ({confidence:.2f})"
+            
+            # Display both material and color
+            text = f"{predicted_class} - {color} ({confidence:.2f})"
             cv2.putText(frame, text, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
         
         # Display frame
