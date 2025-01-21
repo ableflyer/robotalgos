@@ -4,17 +4,17 @@ import urllib.parse
 import os
 
 # Specify search term
-search_term = "hiwonder raspberry pi robot car"
+search_term = "garbage bin"
 # Encode the search term to URL-friendly format
 encoded_term = urllib.parse.quote_plus(search_term)
 
 # Number of pages to iterate through
-num_pages = 10
+num_pages = 100
 # Number of images per page (Google Images typically shows 20 images per page)
 images_per_page = 20
 
 # Create the save folder if it doesn't exist
-save_folder = 'robot'
+save_folder = 'bin2'
 if not os.path.exists(save_folder):
     os.mkdir(save_folder)
 
@@ -43,7 +43,7 @@ for page in range(num_pages):
 
 # Save images with sequential filenames
 for i, url in enumerate(results):
-    file_name = f"{save_folder}/bin{i+1}.jpg"
+    file_name = f"{save_folder}/bin{i+1+859}.jpg"
 
     # Download image to folder
     try:

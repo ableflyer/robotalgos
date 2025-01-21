@@ -171,13 +171,14 @@ def main():
     ])
     
     # Define classes for classification
-    classes = ['glass', 'metal', 'plastic']
+    # if you're using garbage_classifier.pth, change this to ['glass', 'metal', 'plastic']
+    classes = ['glass', 'metal', 'plastic', 'recycle-bin']
     
     # Initialize classification model with correct number of classes
     classification_model = ResNet(len(classes))
     
     # Load the trained weights
-    model_path = "garbage_classifier.pth"
+    model_path = "classifier_with_bin.pth"
     if Path(model_path).exists():
         classification_model.load_state_dict(torch.load(model_path, map_location=device))
     else:

@@ -189,7 +189,7 @@ def main():
     to_device(model, device)
     model = to_device(ResNet(), device)
     evaluate(model, val_dl)
-    num_epochs = 48
+    num_epochs = 8
     opt_func = torch.optim.Adam
     lr = 5.5e-5
 
@@ -200,8 +200,10 @@ def main():
     predict_external_image("plastic.jpg")
     predict_external_image("image-1177993601.jpg")
     predict_external_image("container.jpg")
+    predict_external_image("storage_bins.jpg")
+    predict_external_image("garbage_bin.jpg")
 
-    torch.save(model.state_dict(), "garbage_classifier.pth")
+    torch.save(model.state_dict(), "classifier_with_bin.pth")
 
 if __name__ == '__main__':
     freeze_support()
