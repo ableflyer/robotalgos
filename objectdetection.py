@@ -2,166 +2,140 @@ import numpy as np
 import pygame
 import math
 from rplidar import RPLidar
-from sklearn.linear_model import RANSACRegressor
+import time
 
-# Set up LIDAR with specified baudrate
-PORT_NAME = '/dev/ttyUSB0'  # Change this for your system (e.g., 'COM3' on Windows)
-BAUDRATE = 460800  # Your LIDAR's baudrate
+# ----- SLAM and Map Parameters -----
+MAP_SIZE = 8.0          # 8x8 meter area
+SCALE = 100             # 100 pixels per meter for visualization
+NUM_PARTICLES = 100     # Number of particles for the filter
+
+# Initialize particles: each particle is (x, y, theta)
+particles = np.empty((NUM_PARTICLES, 3))
+particles[:, 0] = np.random.uniform(0, MAP_SIZE, NUM_PARTICLES)  # x positions
+particles[:, 1] = np.random.uniform(0, MAP_SIZE, NUM_PARTICLES)  # y positions
+particles[:, 2] = np.random.uniform(-math.pi, math.pi, NUM_PARTICLES)  # orientations
+
+# Initialize uniform weights
+weights = np.ones(NUM_PARTICLES) / NUM_PARTICLES
+
+# ----- LIDAR Setup -----
+PORT_NAME = '/dev/ttyUSB0'  # Update to your system's port (e.g., 'COM3' on Windows)
+BAUDRATE = 460800           # Lidar's baudrate
 lidar = RPLidar(PORT_NAME, baudrate=BAUDRATE)
 
-# Set up Pygame
-WINDOW_SIZE = (800, 800)
-SCALE = 100  # Scale factor for visualization
+# ----- Pygame Setup -----
+WINDOW_SIZE = (int(MAP_SIZE * SCALE), int(MAP_SIZE * SCALE))
+pygame.init()
 screen = pygame.display.set_mode(WINDOW_SIZE)
-pygame.display.set_caption("RPLIDAR Room Mapping")
+pygame.display.set_caption("Particle Filter SLAM - Lidar Localization")
 
-BACKGROUND_COLOR = (0, 0, 0)
-GRID_COLOR = (50, 50, 50)
-POINT_COLOR = (255, 255, 0)
-REFERENCE_COLOR = (0, 255, 0)
-LIDAR_COLOR = (0, 0, 255)
-WALL_COLOR = (255, 0, 0)
-
+# ----- Utility Functions -----
 def polar_to_cartesian(distance, angle):
-    """Converts polar coordinates (distance, angle) to Cartesian (x, y)."""
+    """Convert polar coordinates to Cartesian coordinates."""
     radians = math.radians(angle)
     x = distance * math.cos(radians)
     y = distance * math.sin(radians)
     return x, y
 
-def scan_room():
-    """Collects LIDAR data and returns a list of (x, y) coordinates."""
-    points = []
-    print("Scanning room... Press Ctrl+C to stop.")
-    try:
-        for scan in lidar.iter_scans():
-            for _, angle, distance in scan:
-                if 0 < distance < 5000:  # Ignore out-of-range values
-                    x, y = polar_to_cartesian(distance / 1000, angle)  # Convert to meters
-                    points.append((x, y))
-            if len(points) > 1000:  # Limit number of points
-                break
-    except KeyboardInterrupt:
-        print("Stopping scan...")
-    return np.array(points)
+def motion_update(particles, delta_pose):
+    """
+    Update particle poses based on a motion model.
+    delta_pose is (dx, dy, dtheta) estimated from scan matching.
+    Here we add a small amount of noise to simulate uncertainty.
+    """
+    noise_std = np.array([0.005, 0.005, 0.002])
+    for i in range(len(particles)):
+        # Add noise to the motion update
+        dx = delta_pose[0] + np.random.normal(0, noise_std[0])
+        dy = delta_pose[1] + np.random.normal(0, noise_std[1])
+        dtheta = delta_pose[2] + np.random.normal(0, noise_std[2])
+        theta = particles[i, 2]
+        # Apply the motion update in the particle's frame
+        particles[i, 0] += dx * math.cos(theta) - dy * math.sin(theta)
+        particles[i, 1] += dx * math.sin(theta) + dy * math.cos(theta)
+        particles[i, 2] += dtheta
+    return particles
 
-def detect_reference_corner(points):
-    """Finds the bottom-left (min x, min y) corner in the LIDAR scan."""
-    if len(points) < 50:
-        return None  # Not enough data
+def sensor_model(particle, scan_points):
+    """
+    Compute a likelihood for a given particle given the current scan.
+    In a real system, you would compare the expected distances (from your map)
+    with the measured distances. Here we use a dummy model that returns 1.0.
+    """
+    return 1.0
 
-    min_x, min_y = np.min(points[:, 0]), np.min(points[:, 1])
-    
-    # Get points near the bottom-left
-    corner_candidates = points[
-        (points[:, 0] < min_x + 0.2) & (points[:, 1] < min_y + 0.2)
-    ]
-    
-    if len(corner_candidates) > 5:
-        return np.mean(corner_candidates, axis=0)  # Average for stability
-    
-    return (min_x, min_y)
+def update_weights(particles, weights, scan_points):
+    """Update particle weights using the sensor model."""
+    for i, particle in enumerate(particles):
+        weights[i] = sensor_model(particle, scan_points)
+    # Normalize weights
+    weights += 1e-300
+    weights /= np.sum(weights)
+    return weights
 
-def detect_main_wall(points, reference):
-    """Finds the dominant vertical wall close to the reference point using RANSAC."""
-    near_wall = points[np.abs(points[:, 0] - reference[0]) < 0.5]
+def resample_particles(particles, weights):
+    """Resample particles based on their weights."""
+    indices = np.random.choice(len(particles), size=len(particles), p=weights)
+    return particles[indices]
 
-    if len(near_wall) < 20:
-        return None  # Not enough points for a wall
+# ----- Main SLAM Loop -----
+prev_scan = None
+estimated_pose = np.array([MAP_SIZE / 2, MAP_SIZE / 2, 0])  # Start in the center
 
-    # Fit a vertical wall using RANSAC regression
-    model = RANSACRegressor()
-    model.fit(near_wall[:, 0].reshape(-1, 1), near_wall[:, 1])
+try:
+    for scan in lidar.iter_scans():
+        # Process the current scan: convert measurements to (x,y) points (in meters)
+        scan_points = []
+        for quality, angle, distance in scan:
+            if 0 < distance < 5000:  # Accept distances within a valid range
+                d = distance / 1000.0  # Convert from mm to meters
+                x, y = polar_to_cartesian(d, angle)
+                scan_points.append((x, y))
+        scan_points = np.array(scan_points)
 
-    # Predict y values for the estimated wall
-    x_wall = np.array([reference[0], reference[0] + 0.1])  # Small segment
-    y_wall = model.predict(x_wall.reshape(-1, 1))
+        # Estimate relative motion between scans using scan matching (placeholder)
+        # In a real implementation, replace the following with an ICP or similar algorithm.
+        if prev_scan is not None:
+            # Dummy relative motion (e.g., small forward movement)
+            delta_pose = np.array([0.01, 0.0, 0.001])
+        else:
+            delta_pose = np.array([0.0, 0.0, 0.0])
+        prev_scan = scan_points
 
-    return x_wall, y_wall
+        # Particle filter motion update
+        particles = motion_update(particles, delta_pose)
 
-def find_lidar_position(points, reference, wall):
-    """Finds the LIDAR's position based on distance from the reference point and the wall."""
-    if wall is None:
-        return None
+        # Particle filter sensor update
+        weights = update_weights(particles, weights, scan_points)
 
-    wall_x, wall_y = wall
-    wall_mid_y = np.mean(wall_y)  # Middle of the detected wall
+        # Resample particles based on updated weights
+        particles = resample_particles(particles, weights)
 
-    # Find point farthest from the wall in X-direction
-    max_distance = -1
-    lidar_position = None
+        # Estimate current pose as weighted average
+        estimated_pose = np.average(particles, axis=0, weights=weights)
 
-    for x, y in points:
-        distance_to_wall = abs(x - reference[0])  # X-distance to reference
-        if distance_to_wall > max_distance:
-            max_distance = distance_to_wall
-            lidar_position = (x, y)
+        # ----- Visualization -----
+        screen.fill((0, 0, 0))
+        # Draw particles (in yellow)
+        for p in particles:
+            px = int(p[0] * SCALE)
+            py = int(WINDOW_SIZE[1] - p[1] * SCALE)
+            pygame.draw.circle(screen, (255, 255, 0), (px, py), 2)
+        # Draw estimated pose (in blue)
+        ex = int(estimated_pose[0] * SCALE)
+        ey = int(WINDOW_SIZE[1] - estimated_pose[1] * SCALE)
+        pygame.draw.circle(screen, (0, 0, 255), (ex, ey), 5)
+        pygame.display.flip()
+        time.sleep(0.1)
 
-    return lidar_position
+        # Check for Pygame quit event
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                raise KeyboardInterrupt
 
-def transform_points(points, reference_point):
-    """Shifts all points to make the reference point (0, 0)."""
-    return points - np.array(reference_point)
-
-def draw_grid():
-    """Draws a grid on the Pygame screen."""
-    for i in range(9):
-        x = i * SCALE
-        y = WINDOW_SIZE[1] - i * SCALE
-        pygame.draw.line(screen, GRID_COLOR, (x, 0), (x, WINDOW_SIZE[1]))
-        pygame.draw.line(screen, GRID_COLOR, (0, y), (WINDOW_SIZE[0], y))
-
-def draw_points(points, reference, lidar_position, wall):
-    """Draws LIDAR points, reference corner, lidar position, and walls in Pygame."""
-    screen.fill(BACKGROUND_COLOR)
-    draw_grid()
-
-    # Draw LIDAR points
-    for x, y in points:
-        pygame.draw.circle(screen, POINT_COLOR, (int(x * SCALE), int(WINDOW_SIZE[1] - y * SCALE)), 2)
-
-    # Draw reference corner
-    pygame.draw.circle(screen, REFERENCE_COLOR, (int(reference[0] * SCALE), int(WINDOW_SIZE[1] - reference[1] * SCALE)), 6)
-
-    # Draw estimated LIDAR position
-    if lidar_position:
-        pygame.draw.circle(screen, LIDAR_COLOR, (int(lidar_position[0] * SCALE), int(WINDOW_SIZE[1] - lidar_position[1] * SCALE)), 6)
-
-    # Draw detected wall
-    if wall:
-        x_wall, y_wall = wall
-        pygame.draw.line(screen, WALL_COLOR, 
-                         (int(x_wall[0] * SCALE), int(WINDOW_SIZE[1] - y_wall[0] * SCALE)), 
-                         (int(x_wall[1] * SCALE), int(WINDOW_SIZE[1] - y_wall[1] * SCALE)), 3)
-
-    pygame.display.flip()
-
-# 🚀 Step 1: Scan the room
-lidar_points = scan_room()
-
-# 🚀 Step 2: Detect reference corner
-reference_corner = detect_reference_corner(lidar_points)
-print(f"Reference Corner Found: {reference_corner}")
-
-# 🚀 Step 3: Detect main wall near the reference
-wall = detect_main_wall(lidar_points, reference_corner)
-print(f"Main Wall Found: {wall}")
-
-# 🚀 Step 4: Find the actual LIDAR position
-lidar_position = find_lidar_position(lidar_points, reference_corner, wall)
-print(f"Detected LIDAR Position: {lidar_position}")
-
-# 🚀 Step 5: Transform points to align with reference corner
-adjusted_points = transform_points(lidar_points, reference_corner)
-
-# 🚀 Step 6: Display room map in Pygame
-draw_points(adjusted_points, (0, 0), lidar_position, wall)
-
-# Pygame event loop
-while True:
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            lidar.stop()
-            lidar.disconnect()
-            pygame.quit()
-            exit()
+except KeyboardInterrupt:
+    print("SLAM process stopped.")
+finally:
+    lidar.stop()
+    lidar.disconnect()
+    pygame.quit()
