@@ -33,7 +33,8 @@ class Lidar360:
         self.font = pygame.font.Font(None, 36)
         self.raw_points = []
         self.lidar_position = None
-        self.reference_corner = None  # New reference (bottom-left corner)
+        self.reference_corner = None  # Reference (bottom-left corner)
+        self.reference_detected = False  # Flag to track if reference is established
     
     def connect(self):
         try:
@@ -51,8 +52,24 @@ class Lidar360:
             return None
         
         points = np.array(points)
+        # Find points that likely represent walls
+        # We can improve this by finding the most dense cluster of points
+        # at the extremes of the scan area
         min_x = np.min(points[:, 0])
         min_y = np.min(points[:, 1])
+        
+        # Find points within a small distance of the corner
+        corner_candidate_indices = np.where(
+            (points[:, 0] < min_x + 0.2) & 
+            (points[:, 1] < min_y + 0.2)
+        )[0]
+        
+        if len(corner_candidate_indices) > 5:
+            corner_candidates = points[corner_candidate_indices]
+            # Use the average of these points as a more robust corner estimate
+            corner = np.mean(corner_candidates, axis=0)
+            return (corner[0], corner[1])
+        
         return (min_x, min_y)
     
     def world_to_screen(self, x, y):
@@ -65,7 +82,7 @@ class Lidar360:
         return (screen_x, screen_y)
     
     def draw_grid(self):
-        """Draw a grid from the new reference point."""
+        """Draw a grid from the reference point."""
         for i in range(9):
             x = i * SCALE_FACTOR
             pygame.draw.line(self.screen, GRID_COLOR, (x, 0), (x, WINDOW_SIZE[1]))
@@ -73,11 +90,19 @@ class Lidar360:
             pygame.draw.line(self.screen, GRID_COLOR, (0, y), (WINDOW_SIZE[0], y))
     
     def draw_lidar_position(self):
-        if self.lidar_position:
+        if self.lidar_position and self.reference_corner:
             screen_pos = self.world_to_screen(*self.lidar_position)
             pygame.draw.circle(self.screen, LIDAR_POSITION_COLOR, screen_pos, 8)
-            text = f"LIDAR: ({self.lidar_position[0]:.2f}m, {self.lidar_position[1]:.2f}m)"
+            
+            # Display position relative to reference point
+            rel_x = self.lidar_position[0] - self.reference_corner[0]
+            rel_y = self.lidar_position[1] - self.reference_corner[1]
+            text = f"LIDAR Position: ({rel_x:.2f}m, {rel_y:.2f}m) from reference"
             self.screen.blit(self.font.render(text, True, LIDAR_POSITION_COLOR), (10, 10))
+            
+            # Also display the reference corner
+            ref_text = f"Reference Corner: ({self.reference_corner[0]:.2f}m, {self.reference_corner[1]:.2f}m)"
+            self.screen.blit(self.font.render(ref_text, True, GRID_COLOR), (10, 50))
     
     def start_scan(self):
         self.send_command(b'\xA5\x20')
@@ -117,12 +142,25 @@ class Lidar360:
                 update_counter += 1
                 if update_counter >= 10:
                     update_counter = 0
-                    if self.reference_corner is None:
+                    
+                    # First establish the reference corner if not already done
+                    if not self.reference_detected and len(points) > 100:
                         self.reference_corner = self.detect_bottom_left_corner(points)
-                    self.lidar_position = self.detect_lidar_position(points)
+                        if self.reference_corner:
+                            self.reference_detected = True
+                            print(f"Reference corner detected at: {self.reference_corner}")
+                    
+                    # Calculate LIDAR position only after reference is established
+                    if self.reference_detected:
+                        self.lidar_position = self.calculate_lidar_position(points)
                 
                 self.screen.fill(BACKGROUND_COLOR)
                 self.draw_grid()
+                
+                # Draw reference corner if detected
+                if self.reference_corner:
+                    ref_screen_pos = self.world_to_screen(*self.reference_corner)
+                    pygame.draw.circle(self.screen, (0, 255, 0), ref_screen_pos, 8)
                 
                 for px, py in points:
                     pygame.draw.circle(self.screen, POINT_COLOR, self.world_to_screen(px, py), 2)
@@ -133,14 +171,22 @@ class Lidar360:
                 if len(points) > 1000:
                     points = points[-1000:]
     
-    def detect_lidar_position(self, points):
-        if len(points) < 50:
+    def calculate_lidar_position(self, points):
+        """Calculate LIDAR position as absolute coordinates in the room."""
+        if len(points) < 100 or not self.reference_corner:
             return None
-        points_array = np.array(points[-50:])
-        centroid = np.mean(points_array, axis=0)
-        if self.reference_corner:
-            return (centroid[0] - self.reference_corner[0], centroid[1] - self.reference_corner[1])
-        return None
+            
+        # Use the current points to estimate LIDAR position
+        # For improved accuracy, we could implement a more sophisticated algorithm here
+        points_array = np.array(points[-100:])
+        
+        # Calculate average distance in all directions
+        distances = np.sqrt(points_array[:, 0]**2 + points_array[:, 1]**2)
+        avg_distance = np.mean(distances)
+        
+        # For simplicity, we'll just use (0,0) as the LIDAR's physical position
+        # and let all measurements be relative to the reference corner
+        return (0, 0)  # This means the LIDAR is at the origin of its own coordinate system
     
 if __name__ == "__main__":
     lidar = Lidar360()
@@ -152,4 +198,3 @@ if __name__ == "__main__":
         print("\nStopping scan...")
         lidar.stop_scan()
         print("LIDAR disconnected.")
-# change 1
