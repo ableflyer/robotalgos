@@ -1,182 +1,167 @@
-import serial
-import time
-import math
-import pygame
 import numpy as np
+import pygame
+import math
+from rplidar import RPLidar
+from sklearn.linear_model import RANSACRegressor
 
-# LIDAR Serial Port Configuration
-LIDAR_PORT = "/dev/ttyUSB0"
-BAUDRATE = 460800
-TIMEOUT = 1
+# Set up LIDAR with specified baudrate
+PORT_NAME = '/dev/ttyUSB0'  # Change this for your system (e.g., 'COM3' on Windows)
+BAUDRATE = 460800  # Your LIDAR's baudrate
+lidar = RPLidar(PORT_NAME, baudrate=BAUDRATE)
 
-# Pygame Configuration
+# Set up Pygame
 WINDOW_SIZE = (800, 800)
-SCALE_FACTOR = 50  # Scale for 8x8 meter area
+SCALE = 100  # Scale factor for visualization
+screen = pygame.display.set_mode(WINDOW_SIZE)
+pygame.display.set_caption("RPLIDAR Room Mapping")
+
 BACKGROUND_COLOR = (0, 0, 0)
 GRID_COLOR = (50, 50, 50)
-LIDAR_COLOR = (255, 0, 0)
 POINT_COLOR = (255, 255, 0)
-LIDAR_POSITION_COLOR = (0, 255, 255)
+REFERENCE_COLOR = (0, 255, 0)
+LIDAR_COLOR = (0, 0, 255)
+WALL_COLOR = (255, 0, 0)
 
-class Lidar360:
-    def __init__(self, port=LIDAR_PORT, baudrate=BAUDRATE):
-        self.port = port
-        self.baudrate = baudrate
-        self.serial = None
-        self.is_scanning = False
+def polar_to_cartesian(distance, angle):
+    """Converts polar coordinates (distance, angle) to Cartesian (x, y)."""
+    radians = math.radians(angle)
+    x = distance * math.cos(radians)
+    y = distance * math.sin(radians)
+    return x, y
 
-        pygame.init()
-        self.screen = pygame.display.set_mode(WINDOW_SIZE)
-        pygame.display.set_caption("LIDAR Area Mapping")
-        self.font = pygame.font.Font(None, 36)
-
-        self.raw_points = []
-        self.lidar_position = None
-        self.reference_corner = None
-        self.reference_detected = False
-
-    def connect(self):
-        try:
-            self.serial = serial.Serial(self.port, self.baudrate, timeout=TIMEOUT)
-            if self.serial.is_open:
-                print(f"Connected to LIDAR on {self.port}")
-                return True
-        except serial.SerialException as e:
-            print(f"Serial error: {e}")
-            return False
-
-    def detect_bottom_left_corner(self, points):
-        if len(points) < 50:
-            return None
-        points = np.array(points)
-        min_x, min_y = np.min(points[:, 0]), np.min(points[:, 1])
-        corner_candidates = points[
-            (points[:, 0] < min_x + 0.2) & (points[:, 1] < min_y + 0.2)
-        ]
-        return np.mean(corner_candidates, axis=0) if len(corner_candidates) > 5 else (min_x, min_y)
-
-    def world_to_screen(self, x, y):
-        if self.reference_corner:
-            x -= self.reference_corner[0]
-            y -= self.reference_corner[1]
-        screen_x = int(x * SCALE_FACTOR)
-        screen_y = int(WINDOW_SIZE[1] - (y * SCALE_FACTOR))  # Flip y-axis
-        return screen_x, screen_y
-
-    def draw_grid(self):
-        for i in range(9):
-            x, y = i * SCALE_FACTOR, WINDOW_SIZE[1] - i * SCALE_FACTOR
-            pygame.draw.line(self.screen, GRID_COLOR, (x, 0), (x, WINDOW_SIZE[1]))
-            pygame.draw.line(self.screen, GRID_COLOR, (0, y), (WINDOW_SIZE[0], y))
-
-    def draw_lidar_position(self):
-        if self.lidar_position and self.reference_corner:
-            screen_pos = self.world_to_screen(*self.lidar_position)
-            pygame.draw.circle(self.screen, LIDAR_POSITION_COLOR, screen_pos, 8)
-
-            rel_x = self.lidar_position[0] - self.reference_corner[0]
-            rel_y = self.lidar_position[1] - self.reference_corner[1]
-            self.screen.blit(self.font.render(f"LIDAR Position: ({rel_x:.2f}m, {rel_y:.2f}m)", True, LIDAR_POSITION_COLOR), (10, 10))
-            self.screen.blit(self.font.render(f"Reference Corner: ({self.reference_corner[0]:.2f}m, {self.reference_corner[1]:.2f}m)", True, GRID_COLOR), (10, 50))
-
-    def start_scan(self):
-        self.send_command(b'\xA5\x20')
-        self.is_scanning = True
-
-    def stop_scan(self):
-        self.send_command(b'\xA5\x25')
-        self.is_scanning = False
-        self.serial.close()
-        pygame.quit()
-
-    def send_command(self, command):
-        self.serial.write(command)
-        time.sleep(0.1)
-
-    def read_and_display(self):
-        points = []
-        while self.is_scanning:
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    return
-
-            data = self.serial.read(5)
-            if len(data) < 5:
-                continue
-
-            # Debug raw data
-            print(f"Raw Data: {data}")
-
-            # Verify checksum
-            checksum = data[0] ^ data[1] ^ data[2] ^ data[3] ^ data[4]
-            if checksum != 0:
-                print("Checksum failed! Ignoring corrupt data.")
-                continue
-
-            quality = data[0] >> 2
-            angle = ((data[1] | ((data[2] & 0x7F) << 8)) / 64.0)
-            distance_raw = (data[3] | (data[4] << 8))
-
-            # Test different distance scales
-            distance_mm = distance_raw / 4.0
-            distance_cm = distance_raw / 10.0
-            distance_m = distance_raw / 1000.0
-
-            print(f"Raw Distance: {distance_raw} | mm: {distance_mm} | cm: {distance_cm} | m: {distance_m}")
-
-            # Use the correct distance scale
-            distance = distance_m  # Adjust if needed
-
-            if quality > 0 and 0 < distance < 6.0:  # Ensure valid distance
-                x = distance * math.cos(math.radians(angle))
-                y = distance * math.sin(math.radians(angle))
-                points.append((x, y))
-
-                # Apply median filter to remove noise
-                if len(points) > 5:
-                    distances = [p[0] for p in points]
-                    median_distance = sorted(distances)[len(distances) // 2]
-                    if abs(distance - median_distance) > 0.5:
-                        print(f"Outlier detected: {distance}m (Median: {median_distance}m)")
-                        continue
-
-                self.screen.fill(BACKGROUND_COLOR)
-                self.draw_grid()
-
-                if not self.reference_detected and len(points) > 100:
-                    self.reference_corner = self.detect_bottom_left_corner(points)
-                    if self.reference_corner:
-                        self.reference_detected = True
-                        print(f"Reference corner detected at: {self.reference_corner}")
-
-                if self.reference_corner:
-                    pygame.draw.circle(self.screen, (0, 255, 0), self.world_to_screen(*self.reference_corner), 8)
-
-                for px, py in points:
-                    pygame.draw.circle(self.screen, POINT_COLOR, self.world_to_screen(px, py), 2)
-
-                self.draw_lidar_position()
-                pygame.display.flip()
-
-                if len(points) > 1000:
-                    points = points[-1000:]
-
-    def calculate_lidar_position(self, points):
-        if len(points) < 100 or not self.reference_corner:
-            return None
-
-        points_array = np.array(points[-100:])
-        distances = np.sqrt(points_array[:, 0]**2 + points_array[:, 1]**2)
-        avg_distance = np.mean(distances)
-        return (0, 0)  # Keeping LIDAR at origin for now
-
-if __name__ == "__main__":
-    lidar = Lidar360()
+def scan_room():
+    """Collects LIDAR data and returns a list of (x, y) coordinates."""
+    points = []
+    print("Scanning room... Press Ctrl+C to stop.")
     try:
-        if lidar.connect():
-            lidar.start_scan()
-            lidar.read_and_display()
+        for scan in lidar.iter_scans():
+            for _, angle, distance in scan:
+                if 0 < distance < 5000:  # Ignore out-of-range values
+                    x, y = polar_to_cartesian(distance / 1000, angle)  # Convert to meters
+                    points.append((x, y))
+            if len(points) > 1000:  # Limit number of points
+                break
     except KeyboardInterrupt:
-        print("\nStopping scan...")
-        lidar.stop_scan()
-        print("LIDAR disconnected.")
+        print("Stopping scan...")
+    return np.array(points)
+
+def detect_reference_corner(points):
+    """Finds the bottom-left (min x, min y) corner in the LIDAR scan."""
+    if len(points) < 50:
+        return None  # Not enough data
+
+    min_x, min_y = np.min(points[:, 0]), np.min(points[:, 1])
+    
+    # Get points near the bottom-left
+    corner_candidates = points[
+        (points[:, 0] < min_x + 0.2) & (points[:, 1] < min_y + 0.2)
+    ]
+    
+    if len(corner_candidates) > 5:
+        return np.mean(corner_candidates, axis=0)  # Average for stability
+    
+    return (min_x, min_y)
+
+def detect_main_wall(points, reference):
+    """Finds the dominant vertical wall close to the reference point using RANSAC."""
+    near_wall = points[np.abs(points[:, 0] - reference[0]) < 0.5]
+
+    if len(near_wall) < 20:
+        return None  # Not enough points for a wall
+
+    # Fit a vertical wall using RANSAC regression
+    model = RANSACRegressor()
+    model.fit(near_wall[:, 0].reshape(-1, 1), near_wall[:, 1])
+
+    # Predict y values for the estimated wall
+    x_wall = np.array([reference[0], reference[0] + 0.1])  # Small segment
+    y_wall = model.predict(x_wall.reshape(-1, 1))
+
+    return x_wall, y_wall
+
+def find_lidar_position(points, reference, wall):
+    """Finds the LIDAR's position based on distance from the reference point and the wall."""
+    if wall is None:
+        return None
+
+    wall_x, wall_y = wall
+    wall_mid_y = np.mean(wall_y)  # Middle of the detected wall
+
+    # Find point farthest from the wall in X-direction
+    max_distance = -1
+    lidar_position = None
+
+    for x, y in points:
+        distance_to_wall = abs(x - reference[0])  # X-distance to reference
+        if distance_to_wall > max_distance:
+            max_distance = distance_to_wall
+            lidar_position = (x, y)
+
+    return lidar_position
+
+def transform_points(points, reference_point):
+    """Shifts all points to make the reference point (0, 0)."""
+    return points - np.array(reference_point)
+
+def draw_grid():
+    """Draws a grid on the Pygame screen."""
+    for i in range(9):
+        x = i * SCALE
+        y = WINDOW_SIZE[1] - i * SCALE
+        pygame.draw.line(screen, GRID_COLOR, (x, 0), (x, WINDOW_SIZE[1]))
+        pygame.draw.line(screen, GRID_COLOR, (0, y), (WINDOW_SIZE[0], y))
+
+def draw_points(points, reference, lidar_position, wall):
+    """Draws LIDAR points, reference corner, lidar position, and walls in Pygame."""
+    screen.fill(BACKGROUND_COLOR)
+    draw_grid()
+
+    # Draw LIDAR points
+    for x, y in points:
+        pygame.draw.circle(screen, POINT_COLOR, (int(x * SCALE), int(WINDOW_SIZE[1] - y * SCALE)), 2)
+
+    # Draw reference corner
+    pygame.draw.circle(screen, REFERENCE_COLOR, (int(reference[0] * SCALE), int(WINDOW_SIZE[1] - reference[1] * SCALE)), 6)
+
+    # Draw estimated LIDAR position
+    if lidar_position:
+        pygame.draw.circle(screen, LIDAR_COLOR, (int(lidar_position[0] * SCALE), int(WINDOW_SIZE[1] - lidar_position[1] * SCALE)), 6)
+
+    # Draw detected wall
+    if wall:
+        x_wall, y_wall = wall
+        pygame.draw.line(screen, WALL_COLOR, 
+                         (int(x_wall[0] * SCALE), int(WINDOW_SIZE[1] - y_wall[0] * SCALE)), 
+                         (int(x_wall[1] * SCALE), int(WINDOW_SIZE[1] - y_wall[1] * SCALE)), 3)
+
+    pygame.display.flip()
+
+# 🚀 Step 1: Scan the room
+lidar_points = scan_room()
+
+# 🚀 Step 2: Detect reference corner
+reference_corner = detect_reference_corner(lidar_points)
+print(f"Reference Corner Found: {reference_corner}")
+
+# 🚀 Step 3: Detect main wall near the reference
+wall = detect_main_wall(lidar_points, reference_corner)
+print(f"Main Wall Found: {wall}")
+
+# 🚀 Step 4: Find the actual LIDAR position
+lidar_position = find_lidar_position(lidar_points, reference_corner, wall)
+print(f"Detected LIDAR Position: {lidar_position}")
+
+# 🚀 Step 5: Transform points to align with reference corner
+adjusted_points = transform_points(lidar_points, reference_corner)
+
+# 🚀 Step 6: Display room map in Pygame
+draw_points(adjusted_points, (0, 0), lidar_position, wall)
+
+# Pygame event loop
+while True:
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            lidar.stop()
+            lidar.disconnect()
+            pygame.quit()
+            exit()
