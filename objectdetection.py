@@ -10,6 +10,7 @@ BAUDRATE = 460800              # RPLidar C1 baudrate
 ROOM_SIZE = 8.0                # Room dimensions: 8x8 meters
 SCALE = 100                    # Scale for visualization: 100 pixels per meter
 WALL_MARGIN = 0.2              # Margin (in meters) to consider points "touching" a wall
+UPSIDE_DOWN = True             # Set True if the LIDAR is mounted upside down
 
 # ----- Initialize RPLidar -----
 lidar = RPLidar(PORT_NAME, baudrate=BAUDRATE)
@@ -18,19 +19,22 @@ lidar = RPLidar(PORT_NAME, baudrate=BAUDRATE)
 WINDOW_SIZE = (int(ROOM_SIZE * SCALE), int(ROOM_SIZE * SCALE))
 pygame.init()
 screen = pygame.display.set_mode(WINDOW_SIZE)
-pygame.display.set_caption("Mapping & Localization Using Room Walls")
+pygame.display.set_caption("Mapping & Localization Using Room Walls (Upside Down)")
 
 # Colors for visualization
 BACKGROUND_COLOR = (0, 0, 0)
 WALL_COLOR = (255, 0, 0)       # Walls drawn in red
 ROBOT_COLOR = (0, 255, 0)      # Robot position drawn in green
-OBJECT_COLOR = (0, 0, 255)     # Localized objects drawn in blue
+OBJECT_COLOR = (0, 0, 255)     # Detected objects drawn in blue
 
 def get_wall_distance(scan, target_angle, angle_tolerance=10):
     """
     Computes the average distance (in meters) for LIDAR measurements
     within target_angle ± angle_tolerance.
-    For example, use target_angle=180 for the back wall and 270 for the right wall.
+    
+    For example, if UPSIDE_DOWN is False, use target_angle=180 for the back wall
+    and 270 for the right wall. If UPSIDE_DOWN is True, then we use 180 for the
+    back wall and 90 for the wall that is now on the "right" (due to the flip).
     """
     distances = []
     for quality, angle, distance in scan:
@@ -44,17 +48,16 @@ def get_wall_distance(scan, target_angle, angle_tolerance=10):
 def get_global_points(robot_pos, scan):
     """
     Converts LIDAR scan measurements (in the sensor's polar frame) into global coordinates.
-    Assumes the sensor's orientation is aligned with the room.
+    Adjusts the conversion if the sensor is mounted upside down.
     """
     points = []
     for quality, angle, distance in scan:
         if distance > 0:
             d = distance / 1000.0  # Convert mm to meters
             rad = math.radians(angle)
-            # Compute the point in the sensor frame
             x_local = d * math.cos(rad)
-            y_local = d * math.sin(rad)
-            # Global point is sensor position plus the local offset
+            # If upside down, flip the y component.
+            y_local = -d * math.sin(rad) if UPSIDE_DOWN else d * math.sin(rad)
             global_x = robot_pos[0] + x_local
             global_y = robot_pos[1] + y_local
             points.append((global_x, global_y))
@@ -69,10 +72,7 @@ def filter_interior_points(points, room_size, margin):
     for x, y in points:
         if margin < x < (room_size - margin) and margin < y < (room_size - margin):
             filtered.append((x, y))
-    if filtered:
-        return np.array(filtered)
-    else:
-        return np.empty((0, 2))
+    return np.array(filtered) if filtered else np.empty((0, 2))
 
 def cluster_objects(points, eps=0.2, min_samples=3):
     """
@@ -118,35 +118,46 @@ def draw_map(robot_pos, objects):
 def main():
     print("Mapping & Localization started. Close the window to stop.")
     try:
+        # Choose target angles based on mounting orientation.
+        if UPSIDE_DOWN:
+            back_target = 180   # Back wall remains at 180°
+            right_target = 90   # Right wall (from global perspective) is now detected at 90° in sensor frame
+        else:
+            back_target = 180
+            right_target = 270
+            
         while True:
             # Process one LIDAR scan
             for scan in lidar.iter_scans():
                 # Estimate distances to walls:
-                d_back = get_wall_distance(scan, 180, angle_tolerance=10)
-                d_right = get_wall_distance(scan, 270, angle_tolerance=10)
+                d_back = get_wall_distance(scan, back_target, angle_tolerance=10)
+                d_right = get_wall_distance(scan, right_target, angle_tolerance=10)
                 
                 if d_back is not None and d_right is not None:
-                    # Robot's estimated global position:
+                    # Assuming the sensor's coordinate frame is aligned with the room:
+                    # The robot's global position is estimated as:
+                    # x coordinate = measured distance to the back wall,
+                    # y coordinate = measured distance to the right wall.
                     robot_pos = (d_back, d_right)
                     print("Estimated Robot Position (meters):", robot_pos)
                     
-                    # Convert entire scan to global coordinates:
+                    # Convert the entire scan to global coordinates.
                     global_points = get_global_points(robot_pos, scan)
                     
-                    # Filter out points near the walls (i.e. objects touching walls)
+                    # Filter out points that are too close to the walls.
                     interior_points = filter_interior_points(global_points, ROOM_SIZE, WALL_MARGIN)
                     
-                    # Cluster remaining points to find objects
+                    # Cluster the remaining points to detect other objects.
                     object_positions = cluster_objects(interior_points)
                     
-                    # Draw the room, robot, and detected objects
+                    # Draw the room, robot, and detected objects.
                     draw_map(robot_pos, object_positions)
                 
-                # Handle Pygame events
+                # Handle Pygame events.
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         raise KeyboardInterrupt
-                # Process one scan per loop iteration
+                # Process one scan per loop iteration.
                 break
                 
     except KeyboardInterrupt:
