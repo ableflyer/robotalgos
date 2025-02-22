@@ -1,4 +1,3 @@
-# a comment just to check that it's updated
 import threading
 import pygame
 import math
@@ -179,4 +178,65 @@ def plan_path(robot_pos, target_pos):
 
 # ----- LIDAR Scanning Thread -----
 def scanning_thread():
+    """
+    Continuously retrieves LIDAR scans. For each scan, computes distances to the back and right walls,
+    updates the global robot position, and (while scanning_active is True) accumulates scan points for object detection.
+    """
+    global latest_robot_pos, accumulated_points, scanning_active
+    for scan in lidar.iter_scans():
+        d_back = get_wall_distance(scan, BACK_TARGET)
+        d_right = get_wall_distance(scan, RIGHT_TARGET)
+        if d_back is not None and d_right is not None:
+            latest_robot_pos = (d_back, d_right)
+            if scanning_active:
+                pts = get_global_points(latest_robot_pos, scan)
+                if pts.size > 0:
+                    accumulated_points.extend(pts.tolist())
+        # The thread continues to update latest_robot_pos continuously.
+
+# ----- Main Execution -----
+def main():
+    global scanning_active, latest_robot_pos
+
+    # Start the LIDAR scanning thread.
+    thread = threading.Thread(target=scanning_thread, daemon=True)
+    thread.start()
+
+    print("Starting detection phase for", DETECTION_DURATION, "seconds...")
+    time.sleep(DETECTION_DURATION)
+    scanning_active = False  # End accumulation after detection phase
+
+    if latest_robot_pos is None:
+        latest_robot_pos = (ROOM_SIZE / 2, ROOM_SIZE / 2)
+        print("No valid robot position detected during detection phase. Defaulting to:", latest_robot_pos)
+    else:
+        print("Final robot position after detection phase:", latest_robot_pos)
+
+    # Process accumulated scan points to detect objects.
+    filtered_points = filter_interior_points(np.array(accumulated_points), ROOM_SIZE, WALL_MARGIN)
+    objects = cluster_objects(filtered_points)
+    print("Detected objects (cluster centroids):", objects)
     
+    # If an object is detected, plan a path from the robot position to the first object.
+    path = None
+    if objects:
+        path = plan_path(latest_robot_pos, objects[0])
+        print("Planned path:", path)
+    else:
+        print("No objects detected.")
+
+    # Visualization loop: continuously draw room, updated robot position, detected objects, and planned path.
+    running = True
+    while running:
+        draw_map(latest_robot_pos, objects, path)
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+        pygame.time.wait(50)
+    
+    lidar.stop()
+    lidar.disconnect()
+    pygame.quit()
+
+if __name__ == "__main__":
+    main()
