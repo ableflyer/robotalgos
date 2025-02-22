@@ -99,6 +99,10 @@ def get_neighbors(node, grid):
     return [(r, c) for dr, dc in [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
             if 0 <= (r := node[0] + dr) < rows and 0 <= (c := node[1] + dc) < cols and grid[r, c] == 0]
 
+def heuristic(a, b):
+    """Euclidean distance heuristic."""
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
 def a_star(grid, start, goal):
     """A* algorithm for grid-based pathfinding."""
     open_set = [(0, start)]
@@ -122,10 +126,6 @@ def a_star(grid, start, goal):
                 heapq.heappush(open_set, (f_score[neighbor], neighbor))
     return None
 
-def heuristic(a, b):
-    """Euclidean distance heuristic."""
-    return math.hypot(a[0] - b[0], a[1] - b[1])
-
 def plan_path(robot_pos, target_pos):
     """Generate path using A*."""
     grid = np.zeros((int(ROOM_SIZE / CELL_SIZE), int(ROOM_SIZE / CELL_SIZE)), dtype=int)
@@ -137,20 +137,37 @@ def main():
     print("Starting LIDAR scanning...")
     detection_start = time.time()
     accumulated_points, robot_pos = [], None
-    
-    while time.time() - detection_start < DETECTION_DURATION:
-        for scan in lidar.iter_scans():
-            d_back, d_right = get_wall_distance(scan, 180), get_wall_distance(scan, 90)
-            if d_back is not None and d_right is not None:
-                robot_pos = (d_back, d_right)  # Update robot position
-                accumulated_points.extend(get_global_points(robot_pos, scan))
-    
-    objects = cluster_objects(filter_interior_points(np.array(accumulated_points), ROOM_SIZE, WALL_MARGIN))
-    path = plan_path(robot_pos, objects[0]) if objects and robot_pos else None
 
-    while True:
+    # Use the for loop over iter_scans() and check elapsed time inside it.
+    for scan in lidar.iter_scans():
+        # Break if detection duration has elapsed.
+        if time.time() - detection_start >= DETECTION_DURATION:
+            break
+
+        d_back, d_right = get_wall_distance(scan, 180), get_wall_distance(scan, 90)
+        if d_back is not None and d_right is not None:
+            robot_pos = (d_back, d_right)  # Update robot position continuously
+            points = get_global_points(robot_pos, scan)
+            if points.size > 0:
+                accumulated_points.extend(points)
+
+    # Process the accumulated scan points.
+    filtered_points = filter_interior_points(np.array(accumulated_points), ROOM_SIZE, WALL_MARGIN)
+    objects = cluster_objects(filtered_points)
+    print("Detected objects (cluster centroids):", objects)
+    
+    # Plan path if objects are detected and we have a valid robot position.
+    path = plan_path(robot_pos, objects[0]) if objects and robot_pos else None
+    if path:
+        print("Planned path to object:", path)
+
+    # Visualization loop.
+    running = True
+    while running:
         draw_map(robot_pos, objects, path)
-        if pygame.event.get(pygame.QUIT): break
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
 
     lidar.stop()
     lidar.disconnect()
