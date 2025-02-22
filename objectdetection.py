@@ -1,3 +1,4 @@
+import threading
 import pygame
 import math
 import numpy as np
@@ -15,6 +16,11 @@ WALL_MARGIN = 0.2              # Margin (meters) for filtering wall-adjacent poi
 UPSIDE_DOWN = True             # Set True if LIDAR is mounted upside down
 CELL_SIZE = 0.1                # Grid resolution for pathfinding (meters)
 DETECTION_DURATION = 5.0       # Scanning duration (seconds)
+
+# ----- Global Variables -----
+latest_robot_pos = None
+accumulated_points = []
+scanning_active = True  # Controls accumulation during detection phase
 
 # ----- Initialize LIDAR -----
 lidar = RPLidar(PORT_NAME, baudrate=BAUDRATE)
@@ -142,50 +148,61 @@ def plan_path(robot_pos, target_pos):
     goal = world_to_grid(target_pos, CELL_SIZE)
     return a_star(grid, start, goal)
 
-# ----- Main Execution -----
-def main():
-    print("Starting LIDAR scanning...")
-    detection_start = time.time()
-    accumulated_points = []
-    robot_pos = None
+# ----- LIDAR Scanning Thread -----
+def scanning_thread():
+    global latest_robot_pos, accumulated_points, scanning_active
     scan_count = 0
-
-    # Detection phase: iterate over scans until duration exceeded
+    # The iter_scans() generator will continuously yield scans.
     for scan in lidar.iter_scans():
-        if time.time() - detection_start >= DETECTION_DURATION:
-            break
-
         d_back = get_wall_distance(scan, 180)
         d_right = get_wall_distance(scan, 90)
         if d_back is not None and d_right is not None:
-            robot_pos = (d_back, d_right)
+            latest_robot_pos = (d_back, d_right)
             scan_count += 1
-            print(f"Scan {scan_count}: Robot Pos = {robot_pos}")
-            points = get_global_points(robot_pos, scan)
-            if points.size > 0:
-                accumulated_points.extend(points)
-    
-    print("Detection phase complete.")
-    if robot_pos is None:
-        # If no valid position was detected, default to the center of the room.
-        robot_pos = (ROOM_SIZE / 2, ROOM_SIZE / 2)
-        print("No valid robot position detected. Using default:", robot_pos)
-    
+            # During the detection phase, accumulate points.
+            if scanning_active:
+                pts = get_global_points(latest_robot_pos, scan)
+                if pts.size > 0:
+                    accumulated_points.extend(pts.tolist())
+            # Optionally, print some debug info:
+            # print(f"Scan {scan_count}: Robot Pos = {latest_robot_pos}")
+
+# ----- Main Execution -----
+def main():
+    global scanning_active, latest_robot_pos
+
+    # Start the scanning thread.
+    scan_thread = threading.Thread(target=scanning_thread, daemon=True)
+    scan_thread.start()
+
+    print("Starting LIDAR scanning for detection phase...")
+    # Wait for DETECTION_DURATION seconds while the thread accumulates data.
+    time.sleep(DETECTION_DURATION)
+    scanning_active = False  # Stop accumulating points
+
+    # Use the latest robot position; if not available, default to center.
+    if latest_robot_pos is None:
+        latest_robot_pos = (ROOM_SIZE / 2, ROOM_SIZE / 2)
+        print("No valid robot position detected during detection phase. Defaulting to:", latest_robot_pos)
+    else:
+        print("Final robot position after detection phase:", latest_robot_pos)
+
+    # Process the accumulated points.
     filtered_points = filter_interior_points(np.array(accumulated_points), ROOM_SIZE, WALL_MARGIN)
     objects = cluster_objects(filtered_points)
     print("Detected objects (cluster centroids):", objects)
     
     path = None
     if objects:
-        path = plan_path(robot_pos, objects[0])
+        path = plan_path(latest_robot_pos, objects[0])
         print("Planned path:", path)
     else:
         print("No objects detected.")
-    
-    # Visualization loop
+
+    # Visualization loop; robot position will update continuously from the thread.
     running = True
     while running:
-        draw_map(robot_pos, objects, path)
+        draw_map(latest_robot_pos, objects, path)
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
