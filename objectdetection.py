@@ -27,6 +27,26 @@ WALL_COLOR = (255, 0, 0)       # Walls drawn in red
 ROBOT_COLOR = (0, 255, 0)      # Robot position drawn in green
 OBJECT_COLOR = (0, 0, 255)     # Detected objects drawn in blue
 
+# Global list to store persistent object centroids (in global coordinates, in meters)
+persistent_objects = []
+
+def unpack_measurement(measurement):
+    """
+    Unpacks a measurement tuple from the LIDAR.
+    Supports 4-tuple, 3-tuple, or 2-tuple formats.
+    Returns: (quality, angle, distance, extra)
+    """
+    if len(measurement) == 4:
+        return measurement
+    elif len(measurement) == 3:
+        quality, angle, distance = measurement
+        return quality, angle, distance, None
+    elif len(measurement) == 2:
+        angle, distance = measurement
+        return None, angle, distance, None
+    else:
+        raise ValueError("Unexpected measurement format: {}".format(measurement))
+
 def get_wall_distance(scan, target_angle, angle_tolerance=10):
     """
     Computes the average distance (in meters) for LIDAR measurements
@@ -37,7 +57,8 @@ def get_wall_distance(scan, target_angle, angle_tolerance=10):
     back wall and 90 for the wall that is now on the "right" (due to the flip).
     """
     distances = []
-    for quality, angle, distance in scan:
+    for measurement in scan:
+        quality, angle, distance, _ = unpack_measurement(measurement)
         if abs(angle - target_angle) < angle_tolerance:
             if distance > 0:
                 distances.append(distance / 1000.0)  # Convert mm to meters
@@ -51,7 +72,8 @@ def get_global_points(robot_pos, scan):
     Adjusts the conversion if the sensor is mounted upside down.
     """
     points = []
-    for quality, angle, distance in scan:
+    for measurement in scan:
+        quality, angle, distance, _ = unpack_measurement(measurement)
         if distance > 0:
             d = distance / 1000.0  # Convert mm to meters
             rad = math.radians(angle)
@@ -92,10 +114,26 @@ def cluster_objects(points, eps=0.2, min_samples=3):
         object_positions.append(centroid)
     return object_positions
 
+def update_persistent_objects(new_objects, threshold=0.3):
+    """
+    Updates the persistent_objects list with new objects that are not
+    already detected within a certain threshold (in meters).
+    """
+    global persistent_objects
+    for obj in new_objects:
+        exists = False
+        for existing in persistent_objects:
+            if np.linalg.norm(np.array(obj) - np.array(existing)) < threshold:
+                exists = True
+                break
+        if not exists:
+            persistent_objects.append(obj)
+
 def draw_map(robot_pos, objects):
     """
-    Draw the room boundaries, the robot's estimated position, and localized objects.
-    The room is assumed to have walls at x=0, x=ROOM_SIZE and y=0, y=ROOM_SIZE.
+    Draw the room boundaries, the robot's estimated position, and squares
+    representing localized objects. Each square is centered at the object's
+    position and has side length 0.6 meters.
     """
     screen.fill(BACKGROUND_COLOR)
     # Draw room boundary
@@ -107,11 +145,17 @@ def draw_map(robot_pos, objects):
     robot_screen = (int(rx * SCALE), int(WINDOW_SIZE[1] - ry * SCALE))
     pygame.draw.circle(screen, ROBOT_COLOR, robot_screen, 5)
     
-    # Draw each localized object as a blue circle
+    # Draw each persistent object as a blue square
+    square_side = 0.6 * SCALE  # 0.6 meters in pixels
+    half_side = square_side / 2
     for obj in objects:
         ox, oy = obj
-        obj_screen = (int(ox * SCALE), int(WINDOW_SIZE[1] - oy * SCALE))
-        pygame.draw.circle(screen, OBJECT_COLOR, obj_screen, 4)
+        center_x = int(ox * SCALE)
+        center_y = int(WINDOW_SIZE[1] - oy * SCALE)
+        # The square is drawn such that the object's coordinate is at its center.
+        square_rect = pygame.Rect(center_x - half_side, center_y - half_side,
+                                  square_side, square_side)
+        pygame.draw.rect(screen, OBJECT_COLOR, square_rect, 2)
     
     pygame.display.flip()
 
@@ -134,8 +178,7 @@ def main():
                 d_right = get_wall_distance(scan, right_target, angle_tolerance=10)
                 
                 if d_back is not None and d_right is not None:
-                    # Assuming the sensor's coordinate frame is aligned with the room:
-                    # The robot's global position is estimated as:
+                    # Estimate the robot's global position:
                     # x coordinate = measured distance to the back wall,
                     # y coordinate = measured distance to the right wall.
                     robot_pos = (d_back, d_right)
@@ -147,11 +190,14 @@ def main():
                     # Filter out points that are too close to the walls.
                     interior_points = filter_interior_points(global_points, ROOM_SIZE, WALL_MARGIN)
                     
-                    # Cluster the remaining points to detect other objects.
-                    object_positions = cluster_objects(interior_points)
+                    # Cluster the remaining points to detect objects.
+                    new_objects = cluster_objects(interior_points)
                     
-                    # Draw the room, robot, and detected objects.
-                    draw_map(robot_pos, object_positions)
+                    # Update persistent objects (do not update coordinates if already detected)
+                    update_persistent_objects(new_objects, threshold=0.3)
+                    
+                    # Draw the room, robot, and persistent detected objects as squares.
+                    draw_map(robot_pos, persistent_objects)
                 
                 # Handle Pygame events.
                 for event in pygame.event.get():
