@@ -152,7 +152,6 @@ def draw_map(robot_pos, objects):
         ox, oy = obj
         center_x = int(ox * SCALE)
         center_y = int(WINDOW_SIZE[1] - oy * SCALE)
-        # The square is drawn such that the object's coordinate is at its center.
         square_rect = pygame.Rect(center_x - half_side, center_y - half_side,
                                   square_side, square_side)
         pygame.draw.rect(screen, OBJECT_COLOR, square_rect, 2)
@@ -161,11 +160,16 @@ def draw_map(robot_pos, objects):
 
 def main():
     print("Mapping & Localization started. Close the window to stop.")
+    
+    # For a moving LIDAR, we integrate the differences in the measured wall distances.
+    global_robot_pos = None
+    prev_measured_pos = None
+
     try:
         # Choose target angles based on mounting orientation.
         if UPSIDE_DOWN:
             back_target = 180   # Back wall remains at 180°
-            right_target = 90   # Right wall (from global perspective) is now detected at 90° in sensor frame
+            right_target = 90   # Right wall (from global perspective) now at 90° in sensor frame
         else:
             back_target = 180
             right_target = 270
@@ -173,19 +177,29 @@ def main():
         while True:
             # Process one LIDAR scan
             for scan in lidar.iter_scans():
-                # Estimate distances to walls:
+                # Estimate distances to walls from current scan:
                 d_back = get_wall_distance(scan, back_target, angle_tolerance=10)
                 d_right = get_wall_distance(scan, right_target, angle_tolerance=10)
                 
                 if d_back is not None and d_right is not None:
-                    # Estimate the robot's global position:
-                    # x coordinate = measured distance to the back wall,
-                    # y coordinate = measured distance to the right wall.
-                    robot_pos = (d_back, d_right)
-                    print("Estimated Robot Position (meters):", robot_pos)
+                    measured_pos = (d_back, d_right)
+                    # For the first scan, initialize global position
+                    if global_robot_pos is None:
+                        global_robot_pos = measured_pos
+                        prev_measured_pos = measured_pos
+                    else:
+                        # Compute the difference between current and previous measured positions.
+                        delta = (measured_pos[0] - prev_measured_pos[0],
+                                 measured_pos[1] - prev_measured_pos[1])
+                        # Update global robot position by integrating the delta.
+                        global_robot_pos = (global_robot_pos[0] + delta[0],
+                                            global_robot_pos[1] + delta[1])
+                        prev_measured_pos = measured_pos
+
+                    print("Global Robot Position (meters):", global_robot_pos)
                     
-                    # Convert the entire scan to global coordinates.
-                    global_points = get_global_points(robot_pos, scan)
+                    # Convert the entire scan to global coordinates based on the updated robot position.
+                    global_points = get_global_points(global_robot_pos, scan)
                     
                     # Filter out points that are too close to the walls.
                     interior_points = filter_interior_points(global_points, ROOM_SIZE, WALL_MARGIN)
@@ -193,11 +207,11 @@ def main():
                     # Cluster the remaining points to detect objects.
                     new_objects = cluster_objects(interior_points)
                     
-                    # Update persistent objects (do not update coordinates if already detected)
+                    # Update persistent objects (only add new ones).
                     update_persistent_objects(new_objects, threshold=0.3)
                     
-                    # Draw the room, robot, and persistent detected objects as squares.
-                    draw_map(robot_pos, persistent_objects)
+                    # Draw the room, the updated robot position, and persistent detected objects as squares.
+                    draw_map(global_robot_pos, persistent_objects)
                 
                 # Handle Pygame events.
                 for event in pygame.event.get():
