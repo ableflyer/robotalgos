@@ -14,6 +14,7 @@ SCALE = 100                    # Scale for visualization: 100 pixels per meter
 WALL_MARGIN = 0.2              # Margin (in meters) to consider points "touching" a wall
 UPSIDE_DOWN = True             # Set True if the LIDAR is mounted upside down
 CELL_SIZE = 0.1                # Resolution for the cost-map grid (in meters)
+DETECTION_DURATION = 5.0       # Duration (in seconds) to accumulate scan points
 
 # ----- Initialize RPLidar -----
 lidar = RPLidar(PORT_NAME, baudrate=BAUDRATE)
@@ -102,9 +103,10 @@ def draw_map(robot_pos, objects, path=None):
     pygame.draw.rect(screen, WALL_COLOR, rect, 2)
     
     # Draw robot as a green circle
-    rx, ry = robot_pos
-    robot_screen = (int(rx * SCALE), int(WINDOW_SIZE[1] - ry * SCALE))
-    pygame.draw.circle(screen, ROBOT_COLOR, robot_screen, 5)
+    if robot_pos:
+        rx, ry = robot_pos
+        robot_screen = (int(rx * SCALE), int(WINDOW_SIZE[1] - ry * SCALE))
+        pygame.draw.circle(screen, ROBOT_COLOR, robot_screen, 5)
     
     # Draw each localized object as a blue circle
     for obj in objects:
@@ -221,62 +223,69 @@ def plan_path(robot_pos, target_pos, cell_size):
 
 # ----- Main loop -----
 def main():
-    print("Mapping, Localization & Path Planning started. Close the window to stop.")
-    try:
-        # Choose target angles based on mounting orientation.
-        if UPSIDE_DOWN:
-            back_target = 180   # Back wall remains at 180°
-            right_target = 90   # Right wall (from global perspective) now detected at 90° in sensor frame
-        else:
-            back_target = 180
-            right_target = 270
-        
-        while True:
-            # Process one LIDAR scan
-            for scan in lidar.iter_scans():
-                # Estimate distances to walls:
-                d_back = get_wall_distance(scan, back_target, angle_tolerance=10)
-                d_right = get_wall_distance(scan, right_target, angle_tolerance=10)
-                
-                if d_back is not None and d_right is not None:
-                    # Estimate the robot's global position:
-                    # x coordinate = measured distance to the back wall,
-                    # y coordinate = measured distance to the right wall.
-                    robot_pos = (d_back, d_right)
-                    print("Estimated Robot Position (meters):", robot_pos)
-                    
-                    # Convert the entire scan to global coordinates.
-                    global_points = get_global_points(robot_pos, scan)
-                    
-                    # Filter out points that are too close to the walls.
-                    interior_points = filter_interior_points(global_points, ROOM_SIZE, WALL_MARGIN)
-                    
-                    # Cluster the remaining points to detect objects.
-                    object_list = cluster_objects(interior_points)
-                    
-                    # Plan a path to the first object in the list (if available)
-                    planned_path = None
-                    if object_list:
-                        target = object_list[0]
-                        planned_path = plan_path(robot_pos, target, CELL_SIZE)
-                        print("Planning path to object at:", target)
-                    
-                    # Draw the room, robot, objects, and planned path.
-                    draw_map(robot_pos, object_list, planned_path)
-                
-                # Handle Pygame events.
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        raise KeyboardInterrupt
-                # Process one scan per loop iteration.
-                # break  (Uncomment if you wish to process one scan per loop)
-                
-    except KeyboardInterrupt:
-        print("Stopping mapping, localization and path planning.")
-    finally:
-        lidar.stop()
-        lidar.disconnect()
-        pygame.quit()
+    print("Mapping, Localization & Path Planning started.")
+    print(f"Accumulating scan points for {DETECTION_DURATION} seconds...")
+    accumulated_interior_points = []
+    robot_pos = None
+
+    # Choose target angles based on mounting orientation.
+    if UPSIDE_DOWN:
+        back_target = 180   # Back wall remains at 180°
+        right_target = 90   # Right wall (from global perspective) now detected at 90° in sensor frame
+    else:
+        back_target = 180
+        right_target = 270
+    
+    detection_start = time.time()
+    # --- Detection Phase ---
+    while time.time() - detection_start < DETECTION_DURATION:
+        for scan in lidar.iter_scans():
+            d_back = get_wall_distance(scan, back_target, angle_tolerance=10)
+            d_right = get_wall_distance(scan, right_target, angle_tolerance=10)
+            if d_back is not None and d_right is not None:
+                # Estimate robot position from the current scan.
+                robot_pos = (d_back, d_right)
+                # Convert the scan to global coordinates.
+                global_points = get_global_points(robot_pos, scan)
+                # Filter out points near walls.
+                interior_points = filter_interior_points(global_points, ROOM_SIZE, WALL_MARGIN)
+                if len(interior_points) > 0:
+                    accumulated_interior_points.extend(interior_points.tolist())
+            # Check if detection duration is reached.
+            if time.time() - detection_start >= DETECTION_DURATION:
+                break
+
+    # Convert accumulated points to a NumPy array.
+    if accumulated_interior_points:
+        all_points = np.array(accumulated_interior_points)
+    else:
+        all_points = np.empty((0, 2))
+    
+    # Cluster the accumulated points to detect objects.
+    object_list = cluster_objects(all_points)
+    print("Detected objects (cluster centroids):", object_list)
+    
+    # --- Path Planning Phase ---
+    planned_path = None
+    if object_list and robot_pos is not None:
+        target = object_list[0]
+        planned_path = plan_path(robot_pos, target, CELL_SIZE)
+        print("Planning path to object at:", target)
+    else:
+        print("No valid object detected or robot position unavailable.")
+    
+    # --- Visualization Loop ---
+    running = True
+    while running:
+        draw_map(robot_pos, object_list, planned_path)
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+
+    # Cleanup on exit.
+    lidar.stop()
+    lidar.disconnect()
+    pygame.quit()
 
 if __name__ == "__main__":
     main()
