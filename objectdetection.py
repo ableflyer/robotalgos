@@ -1,3 +1,4 @@
+# confirmation
 import threading
 import pygame
 import math
@@ -18,15 +19,15 @@ CELL_SIZE = 0.1                 # Grid resolution for pathfinding (meters)
 DETECTION_DURATION = 5.0        # Scanning duration (seconds) for the detection phase
 
 # ----- Determine Target Angles Based on Orientation -----
-# For a normally mounted LIDAR, one might use 180° for the back wall and 270° for the right wall.
-# When mounted upside down, the right wall is detected at 90°.
+# For a normally mounted LIDAR: use 180° for the back wall and 270° for the right wall.
+# For an upside down LIDAR: the right wall is seen at 90°.
 BACK_TARGET = 180
 RIGHT_TARGET = 90 if UPSIDE_DOWN else 270
 
 # ----- Global Variables -----
-latest_robot_pos = None      # Continuously updated robot position (in meters)
-accumulated_points = []      # Accumulated global scan points for object detection
-scanning_active = True       # Flag to control accumulation during the detection phase
+latest_robot_pos = None      # Continuously updated robot position (meters)
+accumulated_points = []      # Accumulated scan points for object detection
+scanning_active = True       # Flag to control accumulation during detection phase
 
 # ----- Initialize LIDAR -----
 lidar = RPLidar(PORT_NAME, baudrate=BAUDRATE)
@@ -47,22 +48,21 @@ PATH_COLOR = (255, 255, 0)     # Yellow for planned paths
 # ----- LIDAR Processing Functions -----
 def get_wall_distance(scan, target_angle, angle_tolerance=10):
     """
-    Computes the average distance (in meters) for LIDAR measurements
-    within target_angle ± angle_tolerance.
+    Computes the average distance (meters) for measurements within target_angle ± angle_tolerance.
     """
-    distances = [d / 1000.0 for _, angle, d in scan
+    distances = [d / 1000.0 for _, angle, d in scan 
                  if abs(angle - target_angle) < angle_tolerance and d > 0]
     return np.mean(distances) if distances else None
 
 def get_global_points(robot_pos, scan):
     """
-    Converts LIDAR polar coordinates (angle, distance) into global Cartesian coordinates.
-    Adjusts the conversion if the LIDAR is mounted upside down.
+    Converts LIDAR polar coordinates into global Cartesian coordinates.
+    Adjusts for an upside-down mounted LIDAR.
     """
     points = []
     for _, angle, distance in scan:
         if distance > 0:
-            d = distance / 1000.0  # Convert mm to meters
+            d = distance / 1000.0
             rad = math.radians(angle)
             x_local = d * math.cos(rad)
             y_local = -d * math.sin(rad) if UPSIDE_DOWN else d * math.sin(rad)
@@ -72,14 +72,11 @@ def get_global_points(robot_pos, scan):
     return np.array(points)
 
 def filter_interior_points(points, room_size, margin):
-    """Removes points too close to the room walls (within margin)."""
+    """Removes points that are too close to the walls."""
     return np.array([p for p in points if margin < p[0] < (room_size - margin) and margin < p[1] < (room_size - margin)])
 
 def cluster_objects(points, eps=0.2, min_samples=3):
-    """
-    Uses DBSCAN clustering to group accumulated points and returns the centroids
-    of clusters (which are considered as detected objects).
-    """
+    """Clusters points using DBSCAN and returns cluster centroids."""
     if len(points) == 0:
         return []
     clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(points)
@@ -89,20 +86,18 @@ def cluster_objects(points, eps=0.2, min_samples=3):
 # ----- Drawing Function -----
 def draw_map(robot_pos, objects, path=None):
     """
-    Draws the room boundaries, the robot's estimated position, detected objects,
-    and the planned path (if available).
-    Coordinates are converted to screen space (with y=0 at the bottom).
+    Draws room boundaries, robot position, detected objects, and planned path.
     """
     screen.fill(BACKGROUND_COLOR)
     
     # Draw room boundary
     pygame.draw.rect(screen, WALL_COLOR, pygame.Rect(0, 0, ROOM_SIZE * SCALE, ROOM_SIZE * SCALE), 2)
     
-    # Draw robot position
+    # Draw robot position (if available)
     if robot_pos:
         rx, ry = robot_pos
         screen_x = int(rx * SCALE)
-        screen_y = int(WINDOW_SIZE[1] - ry * SCALE)
+        screen_y = int(WINDOW_SIZE[1] - ry * SCALE)  # Invert y-axis for Pygame
         pygame.draw.circle(screen, ROBOT_COLOR, (screen_x, screen_y), 5)
     
     # Draw detected objects
@@ -111,14 +106,14 @@ def draw_map(robot_pos, objects, path=None):
         obj_screen = (int(ox * SCALE), int(WINDOW_SIZE[1] - oy * SCALE))
         pygame.draw.circle(screen, OBJECT_COLOR, obj_screen, 4)
     
-    # Draw planned path if available
+    # Draw planned path (if available)
     if path and len(path) > 1:
         path_points = [(int(x * SCALE), int(WINDOW_SIZE[1] - y * SCALE)) for x, y in path]
         pygame.draw.lines(screen, PATH_COLOR, False, path_points, 2)
     
     pygame.display.flip()
 
-# ----- Cost Map & Path Planning Functions (A*) -----
+# ----- Cost Map & Path Planning (A*) Functions -----
 def world_to_grid(point, cell_size):
     """Converts world coordinates (meters) to grid indices."""
     return (int(point[1] / cell_size), int(point[0] / cell_size))
@@ -167,7 +162,7 @@ def a_star(grid, start, goal):
     return None
 
 def plan_path(robot_pos, target_pos):
-    """Generates a path from robot_pos to target_pos using A* on a cost-map grid."""
+    """Generates a path using A* from robot_pos to target_pos."""
     grid_size = int(ROOM_SIZE / CELL_SIZE)
     grid = np.zeros((grid_size, grid_size), dtype=int)
     # Mark room boundaries as obstacles.
@@ -179,20 +174,26 @@ def plan_path(robot_pos, target_pos):
 # ----- LIDAR Scanning Thread -----
 def scanning_thread():
     """
-    Continuously retrieves LIDAR scans. For each scan, computes distances to the back and right walls,
-    updates the global robot position, and (while scanning_active is True) accumulates scan points for object detection.
+    Continuously retrieves LIDAR scans, computes distances to the back and right walls,
+    updates the global robot position, and (if scanning_active) accumulates scan points.
     """
     global latest_robot_pos, accumulated_points, scanning_active
+    scan_count = 0
     for scan in lidar.iter_scans():
         d_back = get_wall_distance(scan, BACK_TARGET)
         d_right = get_wall_distance(scan, RIGHT_TARGET)
         if d_back is not None and d_right is not None:
             latest_robot_pos = (d_back, d_right)
+            scan_count += 1
+            # Debug: print update every 20 scans
+            if scan_count % 20 == 0:
+                print("Updated robot position:", latest_robot_pos)
+            # Accumulate points only during the detection phase.
             if scanning_active:
                 pts = get_global_points(latest_robot_pos, scan)
                 if pts.size > 0:
                     accumulated_points.extend(pts.tolist())
-        # The thread continues to update latest_robot_pos continuously.
+        # Continue updating latest_robot_pos continuously.
 
 # ----- Main Execution -----
 def main():
@@ -212,20 +213,20 @@ def main():
     else:
         print("Final robot position after detection phase:", latest_robot_pos)
 
-    # Process accumulated scan points to detect objects.
+    # Process accumulated points to detect objects.
     filtered_points = filter_interior_points(np.array(accumulated_points), ROOM_SIZE, WALL_MARGIN)
     objects = cluster_objects(filtered_points)
     print("Detected objects (cluster centroids):", objects)
     
-    # If an object is detected, plan a path from the robot position to the first object.
+    # Plan a path to the first detected object (if any).
     path = None
     if objects:
         path = plan_path(latest_robot_pos, objects[0])
         print("Planned path:", path)
     else:
         print("No objects detected.")
-
-    # Visualization loop: continuously draw room, updated robot position, detected objects, and planned path.
+    
+    # Visualization loop: update display continuously using the latest robot position.
     running = True
     while running:
         draw_map(latest_robot_pos, objects, path)
