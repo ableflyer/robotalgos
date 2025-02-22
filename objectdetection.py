@@ -3,6 +3,8 @@ import math
 import numpy as np
 from rplidar import RPLidar
 from sklearn.cluster import DBSCAN
+import time
+import heapq
 
 # ----- Configuration -----
 PORT_NAME = '/dev/ttyUSB0'     # Change to your LIDAR port (e.g., 'COM3' on Windows)
@@ -11,6 +13,7 @@ ROOM_SIZE = 8.0                # Room dimensions: 8x8 meters
 SCALE = 100                    # Scale for visualization: 100 pixels per meter
 WALL_MARGIN = 0.2              # Margin (in meters) to consider points "touching" a wall
 UPSIDE_DOWN = True             # Set True if the LIDAR is mounted upside down
+CELL_SIZE = 0.1                # Resolution for the cost-map grid (in meters)
 
 # ----- Initialize RPLidar -----
 lidar = RPLidar(PORT_NAME, baudrate=BAUDRATE)
@@ -19,46 +22,22 @@ lidar = RPLidar(PORT_NAME, baudrate=BAUDRATE)
 WINDOW_SIZE = (int(ROOM_SIZE * SCALE), int(ROOM_SIZE * SCALE))
 pygame.init()
 screen = pygame.display.set_mode(WINDOW_SIZE)
-pygame.display.set_caption("Mapping & Localization Using Room Walls (Upside Down)")
+pygame.display.set_caption("Mapping, Localization & Path Planning (Upside Down)")
 
 # Colors for visualization
 BACKGROUND_COLOR = (0, 0, 0)
 WALL_COLOR = (255, 0, 0)       # Walls drawn in red
 ROBOT_COLOR = (0, 255, 0)      # Robot position drawn in green
 OBJECT_COLOR = (0, 0, 255)     # Detected objects drawn in blue
-
-# Global list to store persistent object centroids (in global coordinates, in meters)
-persistent_objects = []
-
-def unpack_measurement(measurement):
-    """
-    Unpacks a measurement tuple from the LIDAR.
-    Supports 4-tuple, 3-tuple, or 2-tuple formats.
-    Returns: (quality, angle, distance, extra)
-    """
-    if len(measurement) == 4:
-        return measurement
-    elif len(measurement) == 3:
-        quality, angle, distance = measurement
-        return quality, angle, distance, None
-    elif len(measurement) == 2:
-        angle, distance = measurement
-        return None, angle, distance, None
-    else:
-        raise ValueError("Unexpected measurement format: {}".format(measurement))
+PATH_COLOR = (255, 255, 0)     # Planned path drawn in yellow
 
 def get_wall_distance(scan, target_angle, angle_tolerance=10):
     """
     Computes the average distance (in meters) for LIDAR measurements
     within target_angle ± angle_tolerance.
-    
-    For example, if UPSIDE_DOWN is False, use target_angle=180 for the back wall
-    and 270 for the right wall. If UPSIDE_DOWN is True, then we use 180 for the
-    back wall and 90 for the wall that is now on the "right" (due to the flip).
     """
     distances = []
-    for measurement in scan:
-        quality, angle, distance, _ = unpack_measurement(measurement)
+    for quality, angle, distance in scan:
         if abs(angle - target_angle) < angle_tolerance:
             if distance > 0:
                 distances.append(distance / 1000.0)  # Convert mm to meters
@@ -72,13 +51,11 @@ def get_global_points(robot_pos, scan):
     Adjusts the conversion if the sensor is mounted upside down.
     """
     points = []
-    for measurement in scan:
-        quality, angle, distance, _ = unpack_measurement(measurement)
+    for quality, angle, distance in scan:
         if distance > 0:
             d = distance / 1000.0  # Convert mm to meters
             rad = math.radians(angle)
             x_local = d * math.cos(rad)
-            # If upside down, flip the y component.
             y_local = -d * math.sin(rad) if UPSIDE_DOWN else d * math.sin(rad)
             global_x = robot_pos[0] + x_local
             global_y = robot_pos[1] + y_local
@@ -114,26 +91,10 @@ def cluster_objects(points, eps=0.2, min_samples=3):
         object_positions.append(centroid)
     return object_positions
 
-def update_persistent_objects(new_objects, threshold=0.3):
+def draw_map(robot_pos, objects, path=None):
     """
-    Updates the persistent_objects list with new objects that are not
-    already detected within a certain threshold (in meters).
-    """
-    global persistent_objects
-    for obj in new_objects:
-        exists = False
-        for existing in persistent_objects:
-            if np.linalg.norm(np.array(obj) - np.array(existing)) < threshold:
-                exists = True
-                break
-        if not exists:
-            persistent_objects.append(obj)
-
-def draw_map(robot_pos, objects):
-    """
-    Draw the room boundaries, the robot's estimated position, and squares
-    representing localized objects. Each square is centered at the object's
-    position and has side length 0.6 meters.
+    Draw the room boundaries, the robot's estimated position, detected objects,
+    and (if available) the planned path.
     """
     screen.fill(BACKGROUND_COLOR)
     # Draw room boundary
@@ -145,83 +106,173 @@ def draw_map(robot_pos, objects):
     robot_screen = (int(rx * SCALE), int(WINDOW_SIZE[1] - ry * SCALE))
     pygame.draw.circle(screen, ROBOT_COLOR, robot_screen, 5)
     
-    # Draw each persistent object as a blue square
-    square_side = 0.6 * SCALE  # 0.6 meters in pixels
-    half_side = square_side / 2
+    # Draw each localized object as a blue circle
     for obj in objects:
         ox, oy = obj
-        center_x = int(ox * SCALE)
-        center_y = int(WINDOW_SIZE[1] - oy * SCALE)
-        square_rect = pygame.Rect(center_x - half_side, center_y - half_side,
-                                  square_side, square_side)
-        pygame.draw.rect(screen, OBJECT_COLOR, square_rect, 2)
+        obj_screen = (int(ox * SCALE), int(WINDOW_SIZE[1] - oy * SCALE))
+        pygame.draw.circle(screen, OBJECT_COLOR, obj_screen, 4)
+    
+    # Draw the planned path (if any) as yellow lines
+    if path:
+        path_points = []
+        for (x, y) in path:
+            screen_x = int(x * SCALE)
+            screen_y = int(WINDOW_SIZE[1] - y * SCALE)
+            path_points.append((screen_x, screen_y))
+        if len(path_points) > 1:
+            pygame.draw.lines(screen, PATH_COLOR, False, path_points, 2)
     
     pygame.display.flip()
 
-def main():
-    print("Mapping & Localization started. Close the window to stop.")
-    
-    # For a moving LIDAR, we integrate the differences in the measured wall distances.
-    global_robot_pos = None
-    prev_measured_pos = None
+# ----- Helper functions for A* pathfinding -----
+def world_to_grid(point, cell_size):
+    """Convert world (meter) coordinates to grid indices (row, col)."""
+    x, y = point
+    col = int(x / cell_size)
+    row = int(y / cell_size)
+    return (row, col)
 
+def grid_to_world(grid_coord, cell_size):
+    """Convert grid indices (row, col) to world coordinates (meters), centered in the cell."""
+    row, col = grid_coord
+    x = (col + 0.5) * cell_size
+    y = (row + 0.5) * cell_size
+    return (x, y)
+
+def get_neighbors(node, grid):
+    """Return valid 8-connected neighbors of the given node in the grid."""
+    neighbors = []
+    rows, cols = grid.shape
+    row, col = node
+    for dr in [-1, 0, 1]:
+        for dc in [-1, 0, 1]:
+            if dr == 0 and dc == 0:
+                continue
+            r, c = row + dr, col + dc
+            if 0 <= r < rows and 0 <= c < cols:
+                # Check if the cell is free (0 means free, 1 means obstacle)
+                if grid[r, c] == 0:
+                    neighbors.append((r, c))
+    return neighbors
+
+def move_cost(current, neighbor):
+    """Return the cost to move from current to neighbor (diagonal moves cost sqrt2)."""
+    if current[0] != neighbor[0] and current[1] != neighbor[1]:
+        return math.sqrt(2)
+    return 1
+
+def heuristic(a, b):
+    """Euclidean distance heuristic."""
+    return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+
+def reconstruct_path(came_from, current):
+    """Reconstruct path from start to current node."""
+    path = [current]
+    while current in came_from:
+        current = came_from[current]
+        path.append(current)
+    path.reverse()
+    return path
+
+def a_star(grid, start, goal):
+    """A* pathfinding on a 2D grid."""
+    open_set = []
+    heapq.heappush(open_set, (0, start))
+    came_from = {}
+    g_score = {start: 0}
+    f_score = {start: heuristic(start, goal)}
+    
+    while open_set:
+        current = heapq.heappop(open_set)[1]
+        if current == goal:
+            return reconstruct_path(came_from, current)
+        
+        for neighbor in get_neighbors(current, grid):
+            tentative_g = g_score[current] + move_cost(current, neighbor)
+            if neighbor not in g_score or tentative_g < g_score[neighbor]:
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative_g
+                f_score[neighbor] = tentative_g + heuristic(neighbor, goal)
+                heapq.heappush(open_set, (f_score[neighbor], neighbor))
+    return None
+
+def plan_path(robot_pos, target_pos, cell_size):
+    """
+    Create a simple cost map (grid) for the room and use A* to plan a path
+    from robot_pos to target_pos.
+    """
+    grid_size = int(ROOM_SIZE / cell_size)
+    grid = np.zeros((grid_size, grid_size), dtype=int)
+    # Mark boundaries as obstacles.
+    grid[0, :] = 1
+    grid[-1, :] = 1
+    grid[:, 0] = 1
+    grid[:, -1] = 1
+
+    start = world_to_grid(robot_pos, cell_size)
+    goal = world_to_grid(target_pos, cell_size)
+    
+    path_grid = a_star(grid, start, goal)
+    if path_grid is None:
+        return None
+    # Convert grid coordinates back to world coordinates.
+    path_world = [grid_to_world(node, cell_size) for node in path_grid]
+    return path_world
+
+# ----- Main loop -----
+def main():
+    print("Mapping, Localization & Path Planning started. Close the window to stop.")
     try:
         # Choose target angles based on mounting orientation.
         if UPSIDE_DOWN:
             back_target = 180   # Back wall remains at 180°
-            right_target = 90   # Right wall (from global perspective) now at 90° in sensor frame
+            right_target = 90   # Right wall (from global perspective) now detected at 90° in sensor frame
         else:
             back_target = 180
             right_target = 270
-            
+        
         while True:
             # Process one LIDAR scan
             for scan in lidar.iter_scans():
-                # Estimate distances to walls from current scan:
+                # Estimate distances to walls:
                 d_back = get_wall_distance(scan, back_target, angle_tolerance=10)
                 d_right = get_wall_distance(scan, right_target, angle_tolerance=10)
                 
                 if d_back is not None and d_right is not None:
-                    measured_pos = (d_back, d_right)
-                    # For the first scan, initialize global position
-                    if global_robot_pos is None:
-                        global_robot_pos = measured_pos
-                        prev_measured_pos = measured_pos
-                    else:
-                        # Compute the difference between current and previous measured positions.
-                        delta = (measured_pos[0] - prev_measured_pos[0],
-                                 measured_pos[1] - prev_measured_pos[1])
-                        # Update global robot position by integrating the delta.
-                        global_robot_pos = (global_robot_pos[0] + delta[0],
-                                            global_robot_pos[1] + delta[1])
-                        prev_measured_pos = measured_pos
-
-                    print("Global Robot Position (meters):", global_robot_pos)
+                    # Estimate the robot's global position:
+                    # x coordinate = measured distance to the back wall,
+                    # y coordinate = measured distance to the right wall.
+                    robot_pos = (d_back, d_right)
+                    print("Estimated Robot Position (meters):", robot_pos)
                     
-                    # Convert the entire scan to global coordinates based on the updated robot position.
-                    global_points = get_global_points(global_robot_pos, scan)
+                    # Convert the entire scan to global coordinates.
+                    global_points = get_global_points(robot_pos, scan)
                     
                     # Filter out points that are too close to the walls.
                     interior_points = filter_interior_points(global_points, ROOM_SIZE, WALL_MARGIN)
                     
                     # Cluster the remaining points to detect objects.
-                    new_objects = cluster_objects(interior_points)
+                    object_list = cluster_objects(interior_points)
                     
-                    # Update persistent objects (only add new ones).
-                    update_persistent_objects(new_objects, threshold=0.3)
+                    # Plan a path to the first object in the list (if available)
+                    planned_path = None
+                    if object_list:
+                        target = object_list[0]
+                        planned_path = plan_path(robot_pos, target, CELL_SIZE)
+                        print("Planning path to object at:", target)
                     
-                    # Draw the room, the updated robot position, and persistent detected objects as squares.
-                    draw_map(global_robot_pos, persistent_objects)
+                    # Draw the room, robot, objects, and planned path.
+                    draw_map(robot_pos, object_list, planned_path)
                 
                 # Handle Pygame events.
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         raise KeyboardInterrupt
                 # Process one scan per loop iteration.
-                break
+                # break  (Uncomment if you wish to process one scan per loop)
                 
     except KeyboardInterrupt:
-        print("Stopping mapping and localization.")
+        print("Stopping mapping, localization and path planning.")
     finally:
         lidar.stop()
         lidar.disconnect()
