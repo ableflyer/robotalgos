@@ -70,17 +70,20 @@ def draw_map(robot_pos, objects, path=None):
     # Draw room boundary
     pygame.draw.rect(screen, WALL_COLOR, pygame.Rect(0, 0, ROOM_SIZE * SCALE, ROOM_SIZE * SCALE), 2)
     
-    # Draw robot position
+    # Draw robot position if available
     if robot_pos:
-        pygame.draw.circle(screen, ROBOT_COLOR, (int(robot_pos[0] * SCALE), int(WINDOW_SIZE[1] - robot_pos[1] * SCALE)), 5)
+        pygame.draw.circle(screen, ROBOT_COLOR, 
+                           (int(robot_pos[0] * SCALE), int(WINDOW_SIZE[1] - robot_pos[1] * SCALE)), 5)
     
     # Draw detected objects
     for obj in objects:
-        pygame.draw.circle(screen, OBJECT_COLOR, (int(obj[0] * SCALE), int(WINDOW_SIZE[1] - obj[1] * SCALE)), 4)
+        pygame.draw.circle(screen, OBJECT_COLOR, 
+                           (int(obj[0] * SCALE), int(WINDOW_SIZE[1] - obj[1] * SCALE)), 4)
     
-    # Draw planned path
+    # Draw planned path if available
     if path and len(path) > 1:
-        pygame.draw.lines(screen, PATH_COLOR, False, [(int(x * SCALE), int(WINDOW_SIZE[1] - y * SCALE)) for x, y in path], 2)
+        path_points = [(int(x * SCALE), int(WINDOW_SIZE[1] - y * SCALE)) for x, y in path]
+        pygame.draw.lines(screen, PATH_COLOR, False, path_points, 2)
 
     pygame.display.flip()
 
@@ -96,8 +99,12 @@ def grid_to_world(grid_coord, cell_size):
 def get_neighbors(node, grid):
     """Get valid 8-connected neighbors in the grid."""
     rows, cols = grid.shape
-    return [(r, c) for dr, dc in [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
-            if 0 <= (r := node[0] + dr) < rows and 0 <= (c := node[1] + dc) < cols and grid[r, c] == 0]
+    neighbors = []
+    for dr, dc in [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]:
+        r, c = node[0] + dr, node[1] + dc
+        if 0 <= r < rows and 0 <= c < cols and grid[r, c] == 0:
+            neighbors.append((r, c))
+    return neighbors
 
 def heuristic(a, b):
     """Euclidean distance heuristic."""
@@ -106,7 +113,9 @@ def heuristic(a, b):
 def a_star(grid, start, goal):
     """A* algorithm for grid-based pathfinding."""
     open_set = [(0, start)]
-    came_from, g_score, f_score = {}, {start: 0}, {start: heuristic(start, goal)}
+    came_from = {}
+    g_score = {start: 0}
+    f_score = {start: heuristic(start, goal)}
     
     while open_set:
         _, current = heapq.heappop(open_set)
@@ -118,57 +127,70 @@ def a_star(grid, start, goal):
             return [grid_to_world(p, CELL_SIZE) for p in reversed(path)]
         
         for neighbor in get_neighbors(current, grid):
-            g = g_score[current] + (math.sqrt(2) if current[0] != neighbor[0] and current[1] != neighbor[1] else 1)
-            if neighbor not in g_score or g < g_score[neighbor]:
+            tentative_g = g_score[current] + (math.sqrt(2) if current[0] != neighbor[0] and current[1] != neighbor[1] else 1)
+            if neighbor not in g_score or tentative_g < g_score[neighbor]:
                 came_from[neighbor] = current
-                g_score[neighbor] = g
-                f_score[neighbor] = g + heuristic(neighbor, goal)
+                g_score[neighbor] = tentative_g
+                f_score[neighbor] = tentative_g + heuristic(neighbor, goal)
                 heapq.heappush(open_set, (f_score[neighbor], neighbor))
     return None
 
 def plan_path(robot_pos, target_pos):
     """Generate path using A*."""
     grid = np.zeros((int(ROOM_SIZE / CELL_SIZE), int(ROOM_SIZE / CELL_SIZE)), dtype=int)
-    start, goal = world_to_grid(robot_pos, CELL_SIZE), world_to_grid(target_pos, CELL_SIZE)
+    start = world_to_grid(robot_pos, CELL_SIZE)
+    goal = world_to_grid(target_pos, CELL_SIZE)
     return a_star(grid, start, goal)
 
 # ----- Main Execution -----
 def main():
     print("Starting LIDAR scanning...")
     detection_start = time.time()
-    accumulated_points, robot_pos = [], None
+    accumulated_points = []
+    robot_pos = None
+    scan_count = 0
 
-    # Use the for loop over iter_scans() and check elapsed time inside it.
+    # Detection phase: iterate over scans until duration exceeded
     for scan in lidar.iter_scans():
-        # Break if detection duration has elapsed.
         if time.time() - detection_start >= DETECTION_DURATION:
             break
 
-        d_back, d_right = get_wall_distance(scan, 180), get_wall_distance(scan, 90)
+        d_back = get_wall_distance(scan, 180)
+        d_right = get_wall_distance(scan, 90)
         if d_back is not None and d_right is not None:
-            robot_pos = (d_back, d_right)  # Update robot position continuously
+            robot_pos = (d_back, d_right)
+            scan_count += 1
+            print(f"Scan {scan_count}: Robot Pos = {robot_pos}")
             points = get_global_points(robot_pos, scan)
             if points.size > 0:
                 accumulated_points.extend(points)
-
-    # Process the accumulated scan points.
+    
+    print("Detection phase complete.")
+    if robot_pos is None:
+        # If no valid position was detected, default to the center of the room.
+        robot_pos = (ROOM_SIZE / 2, ROOM_SIZE / 2)
+        print("No valid robot position detected. Using default:", robot_pos)
+    
     filtered_points = filter_interior_points(np.array(accumulated_points), ROOM_SIZE, WALL_MARGIN)
     objects = cluster_objects(filtered_points)
     print("Detected objects (cluster centroids):", objects)
     
-    # Plan path if objects are detected and we have a valid robot position.
-    path = plan_path(robot_pos, objects[0]) if objects and robot_pos else None
-    if path:
-        print("Planned path to object:", path)
-
-    # Visualization loop.
+    path = None
+    if objects:
+        path = plan_path(robot_pos, objects[0])
+        print("Planned path:", path)
+    else:
+        print("No objects detected.")
+    
+    # Visualization loop
     running = True
     while running:
         draw_map(robot_pos, objects, path)
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-
+        pygame.time.wait(50)
+    
     lidar.stop()
     lidar.disconnect()
     pygame.quit()
